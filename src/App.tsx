@@ -6,43 +6,31 @@ import {
   ChevronRight, Plus, Minus, Settings2, Monitor, Smartphone, Tablet,
   Grid3X3, Undo2, Redo2, Upload, Eye, MoreHorizontal, Search, Move,
   RotateCw, Maximize2, PanelLeftClose, PanelRightClose, Sparkles,
-  Film, Clock, Zap, Palette, Box, Diamond, Check, X, Trash2,
+  Film, Clock, Zap, Palette, Box, Diamond, Check, Trash2,
   Copy, Lock, Unlock, EyeOff, Group, Ungroup, AlignLeft, AlignCenter,
   AlignRight, BringToFront, SendToBack, Save, FolderOpen, Ruler, Magnet
 } from "lucide-react";
 import "./App.css";
 import SplashScreen, { type RecentProject } from "./SplashScreen";
 import { parseProjectFile, serializeProjectFile } from "./project-file";
+import type { Point, VectorObject } from "./editor-types";
+import { importSvg } from "./importers/svg/importSvg";
+import PdfImportDialog from "./importers/pdf/PdfImportDialog";
+import { isIllustratorFile } from "./importers/illustrator";
+import { MAX_IMPORT_BYTES } from "./importers/import-types";
+import type { ImportResult } from "./importers/import-types";
+import DesignToolsPanel, { type DesignToolsTab } from "./ui/DesignToolsPanel";
+import CodeModePanel from "./ui/CodeModePanel";
+import { DEFAULT_DESIGN_SETTINGS, normalizeDesignSettings, type DesignDocumentSettings, type StructureNode } from "./design-document";
+import { reconcileStructure, updateStructureNode } from "./structure/detectStructure";
+import { createComponentDefinition, instantiateComponent, syncComponentInstances } from "./components/componentModel";
+import { applyToken, detectTokens, updateToken } from "./design-tokens/tokenModel";
+import { getResponsiveFrame, resolveResponsiveObjects, validateResponsiveLayout, type Device } from "./responsive/layoutEngine";
+import { generateWebsite } from "./code-generation/generateWebsite";
 
 type Mode = "Design" | "Prototype" | "Animate" | "Code";
 type Tool = "select" | "direct" | "pen" | "pan" | "rect" | "ellipse" | "text";
-type VectorType = "rect" | "ellipse" | "text" | "path";
 type AnimationPreset = "bounce" | "drive" | "spin" | "pulse" | "slide-in" | "shake";
-
-type VectorObject = {
-  id: string;
-  name: string;
-  type: VectorType;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  fill: string;
-  rotation: number;
-  text?: string;
-  fontSize?: number;
-  visible?: boolean;
-  locked?: boolean;
-  groupId?: string;
-  points?: Point[];
-  closed?: boolean;
-  stroke?: string;
-  strokeWidth?: number;
-  strokeDasharray?: string;
-  strokeLinecap?: "butt" | "round" | "square";
-  strokeLinejoin?: "miter" | "round" | "bevel";
-  cornerRadius?: number;
-};
 
 type Keyframe = {
   frame: number;
@@ -74,14 +62,6 @@ function easeProgress(progress: number, easing: Keyframe["easing"]) {
   }
   return progress;
 }
-
-type Point = {
-  x: number;
-  y: number;
-  handleIn?: { x: number; y: number };
-  handleOut?: { x: number; y: number };
-  smooth?: boolean;
-};
 
 function buildVectorPath(points: Point[], x: number, y: number, closed = false) {
   if (!points.length) return "";
@@ -245,159 +225,6 @@ const starterObjects: VectorObject[] = [
 ];
 
 
-function parseSimpleSvgPath(data: string): { points: Point[]; closed: boolean } | null {
-  // Converts SVG line, cubic and quadratic commands into the editor's editable Bezier points.
-  // Arc commands are safely approximated with sampled points rather than discarded.
-  const tokens = data.match(/[AaCcHhLlMmQqSsTtVvZz]|[-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?/g) || [];
-  const points: Point[] = [];
-  let command = "", index = 0, x = 0, y = 0, startX = 0, startY = 0, closed = false;
-  let previousControl: { x: number; y: number } | null = null;
-  let previousCommand = "";
-  const isCommand = (token: string) => /^[A-Za-z]$/.test(token);
-  const read = () => {
-    if (index >= tokens.length || isCommand(tokens[index])) throw new Error("Missing SVG path parameter");
-    const value = Number(tokens[index++]);
-    if (!Number.isFinite(value)) throw new Error("Invalid SVG path parameter");
-    return value;
-  };
-  const current = () => points[points.length - 1];
-  const addLine = (nx: number, ny: number) => { x = nx; y = ny; points.push({ x, y }); previousControl = null; };
-  const addCubic = (c1: { x: number; y: number }, c2: { x: number; y: number }, end: { x: number; y: number }) => {
-    const from = current();
-    if (!from) return;
-    from.handleOut = { x: c1.x - x, y: c1.y - y };
-    x = end.x; y = end.y;
-    points.push({ x, y, handleIn: { x: c2.x - x, y: c2.y - y } });
-    previousControl = c2;
-  };
-  try {
-    while (index < tokens.length) {
-      if (isCommand(tokens[index])) command = tokens[index++];
-      if (!command) return null;
-      const relative = command === command.toLowerCase();
-      const upper = command.toUpperCase();
-      const px = (v: number) => relative ? x + v : v;
-      const py = (v: number) => relative ? y + v : v;
-      if (upper === "Z") {
-        closed = true; x = startX; y = startY; command = ""; previousControl = null; previousCommand = upper; continue;
-      }
-      if (upper === "M") {
-        const nx = px(read()), ny = py(read());
-        if (points.length) return null; // Multiple subpaths need separate editor objects.
-        x = nx; y = ny; startX = x; startY = y; points.push({ x, y });
-        command = relative ? "l" : "L"; previousControl = null; previousCommand = upper; continue;
-      }
-      if (upper === "L") addLine(px(read()), py(read()));
-      else if (upper === "H") addLine(px(read()), y);
-      else if (upper === "V") addLine(x, py(read()));
-      else if (upper === "C") {
-        const c1 = { x: px(read()), y: py(read()) };
-        const c2 = { x: px(read()), y: py(read()) };
-        const end = { x: px(read()), y: py(read()) };
-        addCubic(c1, c2, end);
-      } else if (upper === "S") {
-        const c1 = (previousCommand === "C" || previousCommand === "S") && previousControl
-          ? { x: 2 * x - previousControl.x, y: 2 * y - previousControl.y }
-          : { x, y };
-        const c2 = { x: px(read()), y: py(read()) };
-        const end = { x: px(read()), y: py(read()) };
-        addCubic(c1, c2, end);
-      } else if (upper === "Q" || upper === "T") {
-        const q = upper === "Q"
-          ? { x: px(read()), y: py(read()) }
-          : (previousCommand === "Q" || previousCommand === "T") && previousControl
-            ? { x: 2 * x - previousControl.x, y: 2 * y - previousControl.y }
-            : { x, y };
-        const end = { x: px(read()), y: py(read()) };
-        const c1 = { x: x + (2 / 3) * (q.x - x), y: y + (2 / 3) * (q.y - y) };
-        const c2 = { x: end.x + (2 / 3) * (q.x - end.x), y: end.y + (2 / 3) * (q.y - end.y) };
-        addCubic(c1, c2, end); previousControl = q;
-      } else if (upper === "A") {
-        let rx = Math.abs(read()), ry = Math.abs(read());
-        const rotation = read() * Math.PI / 180;
-        const largeArc = read() !== 0, sweep = read() !== 0;
-        const end = { x: px(read()), y: py(read()) };
-        // SVG endpoint-to-center arc conversion, then flatten to short editable segments.
-        if (rx === 0 || ry === 0 || (end.x === x && end.y === y)) { addLine(end.x, end.y); }
-        else {
-          const cos = Math.cos(rotation), sin = Math.sin(rotation);
-          const dx = (x - end.x) / 2, dy = (y - end.y) / 2;
-          const xp = cos * dx + sin * dy, yp = -sin * dx + cos * dy;
-          const radiusScale = xp * xp / (rx * rx) + yp * yp / (ry * ry);
-          if (radiusScale > 1) { const correction = Math.sqrt(radiusScale); rx *= correction; ry *= correction; }
-          const numerator = Math.max(0, rx * rx * ry * ry - rx * rx * yp * yp - ry * ry * xp * xp);
-          const denominator = Math.max(1e-12, rx * rx * yp * yp + ry * ry * xp * xp);
-          const factor = (largeArc === sweep ? -1 : 1) * Math.sqrt(numerator / denominator);
-          const cxp = factor * rx * yp / ry, cyp = factor * -ry * xp / rx;
-          const cx = cos * cxp - sin * cyp + (x + end.x) / 2;
-          const cy = sin * cxp + cos * cyp + (y + end.y) / 2;
-          const angle = (ux: number, uy: number, vx: number, vy: number) => Math.atan2(ux * vy - uy * vx, ux * vx + uy * vy);
-          const ux = (xp - cxp) / rx, uy = (yp - cyp) / ry, vx = (-xp - cxp) / rx, vy = (-yp - cyp) / ry;
-          let theta = Math.atan2(uy, ux), delta = angle(ux, uy, vx, vy);
-          if (!sweep && delta > 0) delta -= 2 * Math.PI;
-          if (sweep && delta < 0) delta += 2 * Math.PI;
-          const segments = Math.max(4, Math.ceil(Math.abs(delta) / (Math.PI / 18)));
-          for (let i = 1; i <= segments; i++) {
-            const a = theta + delta * i / segments;
-            const nx = cx + rx * Math.cos(a) * cos - ry * Math.sin(a) * sin;
-            const ny = cy + rx * Math.cos(a) * sin + ry * Math.sin(a) * cos;
-            addLine(i === segments ? end.x : nx, i === segments ? end.y : ny);
-          }
-        }
-      } else return null;
-      previousCommand = upper;
-    }
-  } catch { return null; }
-  return points.length ? { points, closed } : null;
-}
-
-function importSvgMarkup(markup: string, fileName: string): VectorObject[] {
-  const doc = new DOMParser().parseFromString(markup, "image/svg+xml");
-  if (doc.querySelector("parsererror") || doc.documentElement.localName !== "svg") throw new Error("The selected file is not valid SVG.");
-  if (doc.querySelector("script, foreignObject, iframe, object, embed")) throw new Error("This SVG contains active or embedded content and was blocked.");
-  const root = doc.documentElement;
-  const vb = (root.getAttribute("viewBox") || `0 0 ${Number(root.getAttribute("width")) || 800} ${Number(root.getAttribute("height")) || 480}`).trim().split(/[ ,]+/).map(Number);
-  if (vb.length !== 4 || vb.some(value => !Number.isFinite(value)) || vb[2] <= 0 || vb[3] <= 0) throw new Error("SVG has invalid dimensions or viewBox.");
-  const [vx, vy, vw, vh] = vb;
-  const scale = Math.min(800 / vw, 480 / vh);
-  const offsetX = (800 - vw * scale) / 2 - vx * scale;
-  const offsetY = (480 - vh * scale) / 2 - vy * scale;
-  const result: VectorObject[] = [];
-  const nodes = Array.from(root.querySelectorAll("rect,circle,ellipse,text,path"));
-  nodes.forEach((node, index) => {
-    if (node.closest("defs,clipPath,mask,pattern,marker,symbol") || node.hasAttribute("transform")) return;
-    for (const attr of Array.from(node.attributes)) if (/^on/i.test(attr.name) || /javascript:|https?:|data:/i.test(attr.value) && /href/i.test(attr.name)) return;
-    const style = node.getAttribute("style") || "";
-    const styleValue = (key: string) => style.match(new RegExp(`(?:^|;)\\s*${key}\\s*:\\s*([^;]+)`, "i"))?.[1]?.trim();
-    const fill = node.getAttribute("fill") || styleValue("fill") || "#000000";
-    const stroke = node.getAttribute("stroke") || styleValue("stroke") || "none";
-    const strokeWidth = Number(node.getAttribute("stroke-width") || styleValue("stroke-width") || 1);
-    const opacity = Number(node.getAttribute("opacity") || styleValue("opacity") || 1);
-    const common = { id: `svg-${Date.now()}-${index}`, name: `${fileName.replace(/\.svg$/i, "")} / ${node.localName} ${index + 1}`, fill, rotation: 0, ...(stroke !== "none" ? { stroke, strokeWidth: strokeWidth * scale } : {}) };
-    const n = (key: string, fallback = 0) => Number(node.getAttribute(key) || fallback);
-    let object: VectorObject | null = null;
-    if (node.localName === "rect") {
-      const x = n("x"), y = n("y"), w = n("width"), h = n("height"); if (w <= 0 || h <= 0) return;
-      object = { ...common, type: "rect", x: x * scale + offsetX, y: y * scale + offsetY, width: w * scale, height: h * scale, fill, cornerRadius: n("rx") * scale };
-    } else if (node.localName === "circle" || node.localName === "ellipse") {
-      const cx = n("cx"), cy = n("cy"), rx = node.localName === "circle" ? n("r") : n("rx"), ry = node.localName === "circle" ? rx : n("ry"); if (rx <= 0 || ry <= 0) return;
-      object = { ...common, type: "ellipse", x: (cx - rx) * scale + offsetX, y: (cy - ry) * scale + offsetY, width: 2 * rx * scale, height: 2 * ry * scale, fill };
-    } else if (node.localName === "text") {
-      const value = node.textContent?.trim(); if (!value) return;
-      const size = n("font-size", 16) * scale;
-      object = { ...common, type: "text", x: n("x") * scale + offsetX, y: n("y") * scale + offsetY - size, width: Math.max(40, value.length * size * .6), height: size * 1.3, fill, text: value, fontSize: size };
-    } else if (node.localName === "path") {
-      const parsed = parseSimpleSvgPath(node.getAttribute("d") || ""); if (!parsed) return;
-      const xs = parsed.points.map(point => point.x), ys = parsed.points.map(point => point.y);
-      const minX = Math.min(...xs), minY = Math.min(...ys), maxX = Math.max(...xs), maxY = Math.max(...ys);
-      object = { ...common, type: "path", x: minX * scale + offsetX, y: minY * scale + offsetY, width: Math.max(1, (maxX-minX)*scale), height: Math.max(1, (maxY-minY)*scale), fill: parsed.closed ? fill : "none", points: parsed.points.map(point => ({ x: (point.x-minX)*scale, y: (point.y-minY)*scale })), closed: parsed.closed, ...(stroke !== "none" ? { stroke, strokeWidth: strokeWidth * scale } : {}) };
-    }
-    if (object && opacity > 0) result.push(object);
-  });
-  if (!result.length) throw new Error("No supported editable SVG elements were found. Supported: rectangles, circles, ellipses, text, and paths using M/L/H/V/C/S/Q/T/A/Z commands. Multiple path subpaths are not yet supported.");
-  return result;
-}
-
 function readLocalProject(): Record<string, unknown> | null {
   try {
     const raw = localStorage.getItem("design-clover-project-v1");
@@ -409,6 +236,7 @@ function readLocalProject(): Record<string, unknown> | null {
 
 function App() {
   const [showSplash, setShowSplash] = useState(true);
+  const [pdfImportFile, setPdfImportFile] = useState<File | null>(null);
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>(() => {
     try {
       const stored = JSON.parse(localStorage.getItem("design-clover-recent-projects-v1") || "[]") as RecentProject[];
@@ -423,7 +251,8 @@ function App() {
             name: typeof local.name === "string" ? local.name : "Untitled Project",
             objects: local.objects as unknown[],
             keyframes: local.keyframes && typeof local.keyframes === "object" ? local.keyframes as Record<string, unknown[]> : {},
-            device: typeof local.device === "string" ? local.device : "desktop"
+            device: typeof local.device === "string" ? local.device : "desktop",
+            designSettings: local.designSettings
           }
         }];
       }
@@ -443,7 +272,12 @@ function App() {
   const [easing, setEasing] = useState<Keyframe["easing"]>("ease-in-out");
   const [selectedPreset, setSelectedPreset] = useState<AnimationPreset>("bounce");
   const [zoom, setZoom] = useState(75);
-  const [device, setDevice] = useState(() => { const saved = readLocalProject(); return ["desktop", "tablet", "mobile"].includes(String(saved?.device)) ? String(saved?.device) : "desktop"; });
+  const [device, setDevice] = useState<Device>(() => {
+    const saved = readLocalProject();
+    return saved?.device === "mobile" || saved?.device === "tablet" ? saved.device : "desktop";
+  });
+  const [designSettings, setDesignSettings] = useState(() => normalizeDesignSettings(readLocalProject()?.designSettings));
+  const [designToolsTab, setDesignToolsTab] = useState<DesignToolsTab>("layers");
   const [showLeft, setShowLeft] = useState(true);
   const [showRight, setShowRight] = useState(true);
   const [showCode, setShowCode] = useState(false);
@@ -466,12 +300,12 @@ function App() {
   const [rightWidth, setRightWidth] = useState(260);
   const [projectName, setProjectName] = useState(() => typeof readLocalProject()?.name === "string" ? String(readLocalProject()?.name) : "Untitled Project");
   const [saveStatus, setSaveStatus] = useState("Saved locally");
-  const rememberRecentProject = useCallback((snapshot: { name: string; objects: VectorObject[]; keyframes: Record<string, Keyframe[]>; device: string }) => {
+  const rememberRecentProject = useCallback((snapshot: { name: string; objects: VectorObject[]; keyframes: Record<string, Keyframe[]>; device: string; designSettings?: DesignDocumentSettings }) => {
     const project: RecentProject = {
       id: `${snapshot.name}-${Date.now()}`,
       name: snapshot.name || "Untitled Project",
       updatedAt: new Date().toISOString(),
-      snapshot: { name: snapshot.name || "Untitled Project", objects: snapshot.objects, keyframes: snapshot.keyframes, device: snapshot.device }
+      snapshot: { name: snapshot.name || "Untitled Project", objects: snapshot.objects, keyframes: snapshot.keyframes, device: snapshot.device, designSettings: snapshot.designSettings }
     };
     setRecentProjects((current) => {
       const next = [project, ...current.filter((item) => item.name !== project.name)].slice(0, 8);
@@ -485,6 +319,7 @@ function App() {
     setObjects(freshObjects);
     setKeyframes({});
     setDevice("desktop");
+    setDesignSettings(DEFAULT_DESIGN_SETTINGS);
     setProjectName("Untitled Project");
     setSelected("clover-rect");
     setSelectedIds(["clover-rect"]);
@@ -493,10 +328,9 @@ function App() {
     setTool("select");
     setMode("Design");
     setSaveStatus("New project");
-    historyRef.current = [freshObjects];
-    historyIndexRef.current = 0;
+    resetHistory(freshObjects, DEFAULT_DESIGN_SETTINGS);
     setHistoryVersion((value) => value + 1);
-    rememberRecentProject({ name: "Untitled Project", objects: freshObjects, keyframes: {}, device: "desktop" });
+    rememberRecentProject({ name: "Untitled Project", objects: freshObjects, keyframes: {}, device: "desktop", designSettings: DEFAULT_DESIGN_SETTINGS });
     setShowSplash(false);
   };
 
@@ -505,14 +339,15 @@ function App() {
     if (!snapshot || !Array.isArray(snapshot.objects)) return;
     setObjects(snapshot.objects as VectorObject[]);
     setKeyframes(snapshot.keyframes && typeof snapshot.keyframes === "object" ? snapshot.keyframes as Record<string, Keyframe[]> : {});
-    setDevice(["desktop", "tablet", "mobile"].includes(snapshot.device) ? snapshot.device : "desktop");
+    setDevice(snapshot.device === "tablet" || snapshot.device === "mobile" ? snapshot.device : "desktop");
+    const restoredSettings = normalizeDesignSettings(snapshot.designSettings);
+    setDesignSettings(restoredSettings);
     setProjectName(snapshot.name || project.name);
     setSelected("");
     setSelectedIds([]);
     setFrame(0);
     setPlaying(false);
-    historyRef.current = [snapshot.objects as VectorObject[]];
-    historyIndexRef.current = 0;
+    resetHistory(snapshot.objects as VectorObject[], restoredSettings);
     setHistoryVersion((value) => value + 1);
     setSaveStatus("Recent project opened");
     setShowSplash(false);
@@ -521,11 +356,12 @@ function App() {
   const [projectInputKey, setProjectInputKey] = useState(0);
   const [svgInputKey, setSvgInputKey] = useState(0);
   const [, setHistoryVersion] = useState(0);
-  const historyRef = useRef<VectorObject[][]>([objects]);
+  const historyRef = useRef<Array<{ objects: VectorObject[]; designSettings: DesignDocumentSettings }>>([{ objects, designSettings }]);
   const historyIndexRef = useRef(0);
   const skipHistoryRef = useRef(false);
   const resizePanelRef = useRef<"left" | "right" | null>(null);
   const panDragRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
   const dragOffset = useRef({ x: 0, y: 0 });
   const dragSelectionRef = useRef<string[]>([]);
@@ -533,31 +369,62 @@ function App() {
   const dragOriginsRef = useRef<Record<string, { x: number; y: number }>>({});
   const dragKeyframesRef = useRef<Record<string, Keyframe[]>>({});
 
+  function resetHistory(nextObjects: VectorObject[], nextSettings: DesignDocumentSettings) {
+    historyRef.current = [{ objects: nextObjects, designSettings: nextSettings }];
+    historyIndexRef.current = 0;
+    setHistoryVersion((value) => value + 1);
+  }
+
   useEffect(() => {
     if (skipHistoryRef.current) {
       skipHistoryRef.current = false;
       return;
     }
     const history = historyRef.current;
-    if (history[historyIndexRef.current] === objects) return;
+    const current = history[historyIndexRef.current];
+    if (current.objects === objects && current.designSettings === designSettings) return;
     const next = history.slice(0, historyIndexRef.current + 1);
-    next.push(objects);
+    next.push({ objects, designSettings });
     if (next.length > 80) next.shift();
     historyRef.current = next;
     historyIndexRef.current = next.length - 1;
     setHistoryVersion((value) => value + 1);
-  }, [objects]);
+  }, [objects, designSettings]);
 
   useEffect(() => {
     try {
       localStorage.setItem("design-clover-project-v1", JSON.stringify({
-        version: 1, name: projectName, objects, keyframes, device
+        version: 1, name: projectName, objects, keyframes, device, designSettings
       }));
       setSaveStatus("Saved locally");
     } catch (error) {
       setSaveStatus("Local save unavailable");
     }
-  }, [objects, keyframes, device, projectName]);
+  }, [objects, keyframes, device, projectName, designSettings]);
+
+  useEffect(() => {
+    const structure = reconcileStructure(designSettings.structure, objects);
+    if (JSON.stringify(structure) !== JSON.stringify(designSettings.structure)) {
+      setDesignSettings((current) => ({ ...current, structure }));
+    }
+  }, [objects, designSettings.structure]);
+
+  useEffect(() => {
+    if (!designSettings.components.length) return;
+    const updatedDefinitions = designSettings.components.map((definition) => {
+      const masterObjects = objects.filter((object) => object.componentDefinitionId === definition.id && !object.componentInstanceId);
+      if (!masterObjects.length || JSON.stringify(masterObjects) === JSON.stringify(definition.objects)) return definition;
+      return { ...definition, objects: masterObjects.map((object) => ({ ...object })), updatedAt: Date.now() };
+    });
+    const definitionsChanged = updatedDefinitions.some((definition, index) => definition !== designSettings.components[index]);
+    if (definitionsChanged) {
+      setDesignSettings((current) => ({ ...current, components: updatedDefinitions }));
+      return;
+    }
+    let synced = objects;
+    for (const definition of designSettings.components) synced = syncComponentInstances(synced, definition);
+    if (JSON.stringify(synced) !== JSON.stringify(objects)) setObjects(synced);
+  }, [objects, designSettings.components]);
 
   useEffect(() => {
     const move = (event: PointerEvent) => {
@@ -578,7 +445,9 @@ function App() {
     if (historyIndexRef.current <= 0) return;
     historyIndexRef.current -= 1;
     skipHistoryRef.current = true;
-    setObjects(historyRef.current[historyIndexRef.current]);
+    const snapshot = historyRef.current[historyIndexRef.current];
+    setObjects(snapshot.objects);
+    setDesignSettings(snapshot.designSettings);
     setHistoryVersion((value) => value + 1);
   };
 
@@ -586,12 +455,14 @@ function App() {
     if (historyIndexRef.current >= historyRef.current.length - 1) return;
     historyIndexRef.current += 1;
     skipHistoryRef.current = true;
-    setObjects(historyRef.current[historyIndexRef.current]);
+    const snapshot = historyRef.current[historyIndexRef.current];
+    setObjects(snapshot.objects);
+    setDesignSettings(snapshot.designSettings);
     setHistoryVersion((value) => value + 1);
   };
 
   const saveProjectFile = () => {
-    const contents = serializeProjectFile({ name: projectName, objects, keyframes, device });
+    const contents = serializeProjectFile({ name: projectName, objects, keyframes, device, designSettings });
     const blob = new Blob([contents], { type: "application/vnd.design-clover.project" });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
@@ -607,18 +478,20 @@ function App() {
       const parsed = parseProjectFile(contents, fileName);
       setObjects(parsed.objects as VectorObject[]);
       setKeyframes(parsed.keyframes && typeof parsed.keyframes === "object" ? parsed.keyframes as Record<string, Keyframe[]> : {});
-      setDevice(["desktop", "tablet", "mobile"].includes(String(parsed.device)) ? String(parsed.device) : "desktop");
+      setDevice(parsed.device === "mobile" || parsed.device === "tablet" ? parsed.device : "desktop");
+      const restoredSettings = normalizeDesignSettings(parsed.designSettings);
+      setDesignSettings(restoredSettings);
       setProjectName(typeof parsed.name === "string" ? parsed.name : "Imported Project");
       setSelected("");
       setSelectedIds([]);
-      historyRef.current = [parsed.objects as VectorObject[]];
-      historyIndexRef.current = 0;
+      resetHistory(parsed.objects as VectorObject[], restoredSettings);
       setSaveStatus("Project opened");
       rememberRecentProject({
         name: typeof parsed.name === "string" ? parsed.name : "Imported Project",
         objects: parsed.objects as VectorObject[],
         keyframes: parsed.keyframes && typeof parsed.keyframes === "object" ? parsed.keyframes as Record<string, Keyframe[]> : {},
-        device: ["desktop", "tablet", "mobile"].includes(String(parsed.device)) ? String(parsed.device) : "desktop"
+        device: parsed.device === "mobile" || parsed.device === "tablet" ? parsed.device : "desktop",
+        designSettings: restoredSettings
       });
       setShowSplash(false);
     } catch (error) {
@@ -650,28 +523,38 @@ function App() {
     if (file.contents !== undefined) openProjectContents(file.contents, file.fileName);
   }), [openProjectContents]);
 
-  const openSvgFile = (event: ReactChangeEvent<HTMLInputElement>) => {
+  const commitImportedObjects = (result: ImportResult, description: string) => {
+    const imported = result.objects;
+    if (!imported.length) throw new Error("The selected file did not contain importable objects.");
+    setObjects((current) => [...current, ...imported]);
+    setSelected(imported[imported.length - 1].id);
+    setSelectedIds(imported.map((object) => object.id));
+    setTool("select");
+    setMode("Design");
+    setShowSplash(false);
+    setSaveStatus(`Imported ${imported.length} ${description}`);
+    if (result.warnings.length) window.alert(`Import completed with limitations:\n\n${result.warnings.map((warning) => `• ${warning}`).join("\n")}`);
+  };
+
+  const openDesignFile = async (event: ReactChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const imported = importSvgMarkup(String(reader.result || ""), file.name);
-        const merged = [...objects, ...imported];
-        setObjects(merged);
-        setSelected(imported[imported.length - 1].id);
-        setSelectedIds([imported[imported.length - 1].id]);
-        setTool("select");
-        setShowSplash(false);
-        setSaveStatus(`Imported ${imported.length} SVG elements`);
-        setSvgInputKey(value => value + 1);
-      } catch (error) {
-        window.alert(error instanceof Error ? error.message : "Could not import this SVG file.");
-        setSvgInputKey(value => value + 1);
+    try {
+      if (file.size > MAX_IMPORT_BYTES) throw new Error("Import files must be 20 MB or smaller.");
+      const extension = file.name.split(".").pop()?.toLowerCase();
+      if (extension === "svg") {
+        const result = importSvg(await file.text(), file.name);
+        commitImportedObjects(result, `SVG objects from ${file.name}`);
+      } else if (extension === "pdf" || isIllustratorFile(file.name)) {
+        setPdfImportFile(file);
+      } else {
+        throw new Error("Choose an SVG, PDF, or PDF-compatible Illustrator (.ai) file.");
       }
-    };
-    reader.onerror = () => window.alert("Could not read the selected SVG file.");
-    reader.readAsText(file);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : `Could not import "${file.name}".`);
+    } finally {
+      setSvgInputKey((value) => value + 1);
+    }
   };
 
   useEffect(() => {
@@ -703,7 +586,13 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   });
 
-  const selectedObject = objects.find((item) => item.id === selected);
+  const responsiveFrame = useMemo(
+    () => getResponsiveFrame(device, designSettings.breakpoints, designSettings.viewports[device]),
+    [device, designSettings.breakpoints, designSettings.viewports]
+  );
+  const structure = designSettings.structure;
+  const responsiveObjects = useMemo(() => resolveResponsiveObjects(objects, device, responsiveFrame), [objects, device, responsiveFrame]);
+  const selectedObject = responsiveObjects.find((item) => item.id === selected);
 
   const filteredObjects = useMemo(
     () => objects.filter((item) =>
@@ -719,11 +608,11 @@ function App() {
   );
 
   const animatedObjects = useMemo(
-    () => objects.map((item) => ({
+    () => responsiveObjects.map((item) => ({
       ...item,
       animated: getAnimatedTransform(item, frame, keyframes[item.id] || [])
     })),
-    [objects, frame, keyframes]
+    [objects, responsiveObjects, frame, keyframes]
   );
 
   useEffect(() => {
@@ -743,14 +632,160 @@ function App() {
   }, [playing]);
 
   const updateObject = (id: string, patch: Partial<VectorObject>) => {
-    setObjects((current) =>
-      current.map((item) => item.id === id ? { ...item, ...patch } : item)
-    );
+    setObjects((current) => current.map((item) => {
+      if (item.id !== id) return item;
+      const responsiveGeometry = device !== "desktop" &&
+        (patch.x !== undefined || patch.y !== undefined || patch.width !== undefined || patch.height !== undefined);
+      if (responsiveGeometry) {
+        const { x, y, width, height, ...appearance } = patch;
+        const overrides = item.responsiveOverrides || {};
+        return {
+          ...item,
+          ...appearance,
+          responsiveOverrides: {
+            ...overrides,
+            [device]: {
+              ...overrides[device],
+              ...(x !== undefined ? { x } : {}),
+              ...(y !== undefined ? { y } : {}),
+              ...(width !== undefined ? { width } : {}),
+              ...(height !== undefined ? { height } : {})
+            }
+          }
+        };
+      }
+      const points = item.type === "path" && item.points && !patch.points && (patch.width !== undefined || patch.height !== undefined)
+        ? item.points.map((point) => {
+            const scaleX = patch.width !== undefined ? patch.width / item.width : 1;
+            const scaleY = patch.height !== undefined ? patch.height / item.height : 1;
+            return {
+              ...point,
+              x: point.x * scaleX,
+              y: point.y * scaleY,
+              ...(point.handleIn ? { handleIn: { x: point.handleIn.x * scaleX, y: point.handleIn.y * scaleY } } : {}),
+              ...(point.handleOut ? { handleOut: { x: point.handleOut.x * scaleX, y: point.handleOut.y * scaleY } } : {})
+            };
+          })
+        : item.points;
+      return {
+        ...item,
+        ...patch,
+        ...(points ? { points } : {}),
+        ...(item.componentInstanceId && ("text" in patch || "imageData" in patch || "fill" in patch)
+          ? {
+              componentOverrides: {
+                ...item.componentOverrides,
+                ...("text" in patch ? { text: patch.text } : {}),
+                ...("imageData" in patch ? { imageData: patch.imageData } : {}),
+                ...("fill" in patch ? { fill: patch.fill } : {})
+              }
+            }
+          : {})
+      };
+    }));
+  };
+
+  const replaceSelectedImage = (event: ReactChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+    if (!file || !selectedObject || selectedObject.type !== "image") return;
+    if (file.size > MAX_IMPORT_BYTES) {
+      setSaveStatus("Image replacement failed: file exceeds the 20 MB limit");
+      return;
+    }
+    const extension = file.name.split(".").pop()?.toLowerCase();
+    const allowedTypes = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+    const allowedExtensions = ["png", "jpg", "jpeg", "gif", "webp"];
+    if (!allowedTypes.includes(file.type) && !(file.type === "" && extension && allowedExtensions.includes(extension))) {
+      setSaveStatus("Image replacement failed: choose a PNG, JPEG, GIF, or WebP image");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result !== "string") {
+        setSaveStatus("Image replacement failed: could not read the selected file");
+        return;
+      }
+      updateObject(selectedObject.id, { imageData: reader.result });
+      setSaveStatus("Image replaced");
+    };
+    reader.onerror = () => setSaveStatus(`Image replacement failed: ${reader.error?.message || "could not read the selected file"}`);
+    reader.readAsDataURL(file);
+  };
+
+  const responsiveWarnings = validateResponsiveLayout(objects, device, responsiveFrame);
+  const generatedWebsite = useMemo(() => generateWebsite(objects, {
+    title: projectName,
+    breakpoints: designSettings.breakpoints,
+    viewports: designSettings.viewports,
+    structure: designSettings.structure,
+    tokens: designSettings.tokens
+  }), [objects, projectName, designSettings.breakpoints, designSettings.viewports, designSettings.structure, designSettings.tokens]);
+
+  const createComponent = () => {
+    const selectedObjects = objects.filter((object) => selectedIds.includes(object.id));
+    if (!selectedObjects.length) return;
+    const definition = createComponentDefinition(`Component ${designSettings.components.length + 1}`, selectedObjects);
+    const masters = new Map(definition.objects.map((object) => [object.id, object]));
+    setObjects((current) => current.map((object) => selectedIds.includes(object.id)
+      ? { ...object, componentDefinitionId: definition.id, componentInstanceId: undefined, componentSourceId: object.id }
+      : object));
+    setDesignSettings((current) => ({ ...current, components: [...current.components, { ...definition, objects: [...masters.values()] }] }));
+    setSaveStatus(`Created component ${definition.name}`);
+  };
+
+  const insertComponent = (componentId: string) => {
+    const definition = designSettings.components.find((component) => component.id === componentId);
+    if (!definition) return;
+    const instances = instantiateComponent(definition);
+    setObjects((current) => [...current, ...instances]);
+    setSelected(instances[0]?.id || "");
+    setSelectedIds(instances.map((object) => object.id));
+  };
+
+  const duplicateComponent = (componentId: string) => {
+    const source = designSettings.components.find((component) => component.id === componentId);
+    if (!source) return;
+    const copy = createComponentDefinition(`${source.name} copy`, source.objects);
+    setDesignSettings((current) => ({ ...current, components: [...current.components, copy] }));
+  };
+
+  const updateDesignSettings = (patch: Partial<typeof DEFAULT_DESIGN_SETTINGS>) => {
+    setDesignSettings((current) => ({ ...current, ...patch }));
+  };
+
+  const applyDesignToken = (tokenId: string) => {
+    const token = designSettings.tokens.find((item) => item.id === tokenId);
+    if (!token || !selectedIds.length) return;
+    setObjects((current) => applyToken(current, token, selectedIds));
+    setDesignSettings((current) => ({
+      ...current,
+      tokens: current.tokens.map((item) => item.id === tokenId
+        ? { ...item, objectIds: [...new Set([...item.objectIds, ...selectedIds])] }
+        : item)
+    }));
+  };
+
+  const editDesignToken = (tokenId: string, value: string, name?: string) => {
+    const token = designSettings.tokens.find((item) => item.id === tokenId);
+    if (!token) return;
+    if (value !== token.value) setObjects((current) => updateToken(current, token, value));
+    setDesignSettings((current) => ({
+      ...current,
+      tokens: current.tokens.map((item) => item.id === tokenId ? { ...item, value, ...(name !== undefined ? { name } : {}) } : item)
+    }));
   };
 
   const toggleObjectSelection = (id: string, additive = false) => {
     const item = objects.find((object) => object.id === id);
     if (!item) return;
+    if (!additive && item.groupPath?.length) {
+      const pathKey = JSON.stringify(item.groupPath);
+      const groupMembers = objects.filter((object) => JSON.stringify(object.groupPath || []) === pathKey).map((object) => object.id);
+      setSelectedIds(groupMembers);
+      setSelected(id);
+      return;
+    }
     if (!additive && item.groupId) {
       const groupMembers = objects.filter((object) => object.groupId === item.groupId).map((object) => object.id);
       setSelectedIds(groupMembers);
@@ -773,11 +808,33 @@ function App() {
     if (selectedIds.length < 2) return;
     const groupId = `group-${Date.now()}`;
     setObjects((current) => current.map((item) =>
-      selectedIds.includes(item.id) ? { ...item, groupId } : item
+      selectedIds.includes(item.id) ? { ...item, groupId, groupPath: undefined, groupNames: undefined } : item
     ));
   };
 
   const ungroupSelected = () => {
+    const importedPaths = objects
+      .filter((item) => selectedIds.includes(item.id) && item.groupPath?.length)
+      .map((item) => item.groupPath!);
+    if (importedPaths.length) {
+      setObjects((current) => current.map((item) => {
+        const path = item.groupPath;
+        if (!path) return item;
+        const parentPath = importedPaths.find((candidate) =>
+          path.length >= candidate.length && candidate.every((id, index) => path[index] === id)
+        );
+        if (!parentPath) return item;
+        const nextPath = path.filter((_, index) => index !== parentPath.length - 1);
+        const nextNames = item.groupNames?.filter((_, index) => index !== parentPath.length - 1);
+        return {
+          ...item,
+          groupId: nextPath[nextPath.length - 1],
+          groupPath: nextPath.length ? nextPath : undefined,
+          groupNames: nextNames?.length ? nextNames : undefined
+        };
+      }));
+      return;
+    }
     const groupIds = new Set(objects.filter((item) => selectedIds.includes(item.id) && item.groupId).map((item) => item.groupId));
     if (!groupIds.size) return;
     setObjects((current) => current.map((item) => groupIds.has(item.groupId) ? { ...item, groupId: undefined } : item));
@@ -791,7 +848,9 @@ function App() {
       name: `${item.name} copy`,
       x: item.x + 24,
       y: item.y + 24,
-      groupId: undefined
+      groupId: undefined,
+      groupPath: undefined,
+      groupNames: undefined
     }));
     setObjects((current) => [...current, ...copies]);
     setSelected(copies[copies.length - 1]?.id || "");
@@ -835,7 +894,7 @@ function App() {
     }));
   };
 
-  const addObject = (type: VectorType, x = 330, y = 230) => {
+  const addObject = (type: "rect" | "ellipse" | "text", x = 330, y = 230) => {
     const id = `${type}-${Date.now()}`;
     const count = objects.length + 1;
 
@@ -866,9 +925,11 @@ function App() {
     if (!svg) return { x: 0, y: 0 };
 
     const rect = svg.getBoundingClientRect();
+    const logicalWidth = 800 * responsiveFrame.width / 1440;
+    const logicalHeight = 480 * responsiveFrame.height / 900;
     return {
-      x: Math.max(0, Math.min(800, ((event.clientX - rect.left) / rect.width) * 800)),
-      y: Math.max(0, Math.min(480, ((event.clientY - rect.top) / rect.height) * 480))
+      x: Math.max(0, Math.min(logicalWidth, ((event.clientX - rect.left) / rect.width) * logicalWidth)),
+      y: Math.max(0, Math.min(logicalHeight, ((event.clientY - rect.top) / rect.height) * logicalHeight))
     };
   };
 
@@ -934,7 +995,9 @@ function App() {
     const additive = event.shiftKey || event.ctrlKey || event.metaKey;
     const nextSelection = additive
       ? (selectedIds.includes(item.id) ? selectedIds.filter((id) => id !== item.id) : [...selectedIds, item.id])
-      : item.groupId
+      : item.groupPath?.length
+        ? objects.filter((object) => JSON.stringify(object.groupPath || []) === JSON.stringify(item.groupPath)).map((object) => object.id)
+        : item.groupId
         ? objects.filter((object) => object.groupId === item.groupId).map((object) => object.id)
         : [item.id];
 
@@ -955,7 +1018,10 @@ function App() {
     dragSelectionRef.current = nextSelection;
     dragStartPointRef.current = point;
     dragOriginsRef.current = Object.fromEntries(
-      objects.filter((object) => nextSelection.includes(object.id)).map((object) => [object.id, { x: object.x, y: object.y }])
+      objects.filter((object) => nextSelection.includes(object.id)).map((object) => {
+        const responsiveObject = responsiveObjects.find((item) => item.id === object.id) || object;
+        return [object.id, { x: responsiveObject.x, y: responsiveObject.y }];
+      })
     );
     dragKeyframesRef.current = keyframes;
     dragOffset.current = {
@@ -1032,16 +1098,28 @@ function App() {
         const right = Math.max(...moving.map((item) => item.x + item.width));
         const top = Math.min(...moving.map((item) => item.y));
         const bottom = Math.max(...moving.map((item) => item.y + item.height));
+        const logicalWidth = 800 * responsiveFrame.width / 1440;
+        const logicalHeight = 480 * responsiveFrame.height / 900;
         const centerX = (left + right) / 2 + deltaX;
         const centerY = (top + bottom) / 2 + deltaY;
-        if (Math.abs(centerX - 400) <= 8) deltaX += 400 - centerX;
-        if (Math.abs(centerY - 240) <= 8) deltaY += 240 - centerY;
+        if (Math.abs(centerX - logicalWidth / 2) <= 8) deltaX += logicalWidth / 2 - centerX;
+        if (Math.abs(centerY - logicalHeight / 2) <= 8) deltaY += logicalHeight / 2 - centerY;
       }
     }
 
     setObjects((current) => current.map((item) => {
       if (!movingIds.includes(item.id)) return item;
       const origin = dragOriginsRef.current[item.id] || { x: item.x, y: item.y };
+      if (device !== "desktop") {
+        const overrides = item.responsiveOverrides || {};
+        return {
+          ...item,
+          responsiveOverrides: {
+            ...overrides,
+            [device]: { ...overrides[device], x: origin.x + deltaX, y: origin.y + deltaY }
+          }
+        };
+      }
       return { ...item, x: origin.x + deltaX, y: origin.y + deltaY };
     }));
 
@@ -1253,11 +1331,12 @@ function App() {
           <button className="icon-button" title="Redo (Ctrl+Shift+Z)" onClick={redo} disabled={historyIndexRef.current >= historyRef.current.length - 1}><Redo2 size={17} /></button>
           <div className="top-divider" />
           <button className="icon-button" title="Open project" onClick={() => document.getElementById("project-file-input")?.click()}><FolderOpen size={16} /></button>
+          <button className="icon-button" title="Import SVG, PDF, or Illustrator file" onClick={() => document.getElementById("design-import-input")?.click()}><ImageIcon size={16} /></button>
           <button className="icon-button" title="Save Design Clover project (.dc)" onClick={saveProjectFile}><Save size={16} /></button>
           <input key={projectInputKey} id="project-file-input" type="file" accept=".dc,.json,.clover.json,application/json" hidden onChange={openProjectFile} />
-          <input key={svgInputKey} id="svg-file-input" type="file" accept=".svg,image/svg+xml" hidden onChange={openSvgFile} />
+          <input key={svgInputKey} id="design-import-input" type="file" accept=".svg,.pdf,.ai,image/svg+xml,application/pdf,application/postscript" hidden onChange={openDesignFile} />
           <button className="icon-button" title="Settings"><Settings2 size={17} /></button>
-          <button className="share-button"><Upload size={14} /> Export</button>
+          <button className="share-button" onClick={() => changeMode("Code")}><Upload size={14} /> Export</button>
           <button className="avatar">O</button>
         </div>
       </header>
@@ -1323,8 +1402,8 @@ function App() {
               ))}
               <button
                 className="tool-button"
-                title="Import SVG as editable objects"
-                onClick={() => document.getElementById("svg-file-input")?.click()}
+                title="Import SVG, PDF, or Illustrator file"
+                onClick={() => document.getElementById("design-import-input")?.click()}
               >
                 <ImageIcon size={17} />
               </button>
@@ -1333,7 +1412,55 @@ function App() {
               </button>
             </div>
 
-            <div className="panel-section layer-section">
+            <DesignToolsPanel
+              activeTab={designToolsTab}
+              onTabChange={setDesignToolsTab}
+              objects={objects}
+              selectedIds={selectedIds}
+              onSelect={(ids) => {
+                const validIds = ids.filter((id) => objects.some((object) => object.id === id));
+                setSelectedIds(validIds);
+                setSelected(validIds[0] || "");
+              }}
+              structure={structure}
+              onStructureChange={(nodes: StructureNode[]) => updateDesignSettings({ structure: nodes })}
+              onGroup={groupSelected}
+              onUngroup={ungroupSelected}
+              onRoleChange={(nodeId, role) => {
+                setDesignSettings((current) => ({
+                  ...current,
+                  structure: updateStructureNode(current.structure, nodeId, (node) => ({ ...node, role }))
+                }));
+              }}
+              onObjectsChange={setObjects}
+              components={designSettings.components}
+              onCreateComponent={createComponent}
+              onRenameComponent={(id, name) => setDesignSettings((current) => ({ ...current, components: current.components.map((item) => item.id === id ? { ...item, name } : item) }))}
+              onDuplicateComponent={duplicateComponent}
+              onInsertComponent={insertComponent}
+              tokens={designSettings.tokens}
+              onDetectTokens={() => {
+                const detected = detectTokens(objects);
+                setDesignSettings((current) => ({
+                  ...current,
+                  tokens: [...current.tokens, ...detected.filter((token) => !current.tokens.some((existing) => existing.category === token.category && existing.value === token.value))]
+                }));
+              }}
+              onAddToken={() => setDesignSettings((current) => ({
+                ...current,
+                tokens: [...current.tokens, { id: `token-${crypto.randomUUID()}`, name: `Color ${current.tokens.length + 1}`, category: "color", value: "#39d98a", objectIds: [] }]
+              }))}
+              onApplyToken={applyDesignToken}
+              onUpdateToken={editDesignToken}
+              device={device}
+              frame={responsiveFrame}
+              breakpoints={designSettings.breakpoints}
+              onFrameChange={(viewport) => setDesignSettings((current) => ({ ...current, viewports: { ...current.viewports, [device]: viewport } }))}
+              onBreakpointsChange={(breakpoints) => setDesignSettings((current) => ({ ...current, breakpoints }))}
+              onObjectLayoutChange={updateObject}
+              warnings={responsiveWarnings}
+            />
+            {designToolsTab === "layers" && <div className="panel-section layer-section">
               <div className="section-heading">
                 <span><Layers size={14} /> LAYERS</span>
                 <button className="small-icon" onClick={() => addObject("rect")}>
@@ -1370,14 +1497,20 @@ function App() {
                   <div
                     key={item.id}
                     className={`layer-row ${selectedIds.includes(item.id) ? "selected" : ""} ${item.visible === false ? "layer-hidden" : ""}`}
+                    style={{ paddingLeft: 8 + (item.groupPath?.length || 0) * 10 }}
+                    title={item.groupNames?.join(" / ")}
                   >
                     <button
                       className="layer-item"
                       onClick={(event) => toggleObjectSelection(item.id, event.shiftKey || event.ctrlKey || event.metaKey)}
                       title="Click to select; Shift/Ctrl-click to add or remove from selection"
+                      onDoubleClick={() => {
+                        const name = window.prompt("Rename layer", item.name);
+                        if (name?.trim()) updateObject(item.id, { name: name.trim() });
+                      }}
                     >
-                      {item.type === "text" ? <Type size={14} /> : item.type === "ellipse" ? <Circle size={14} /> : item.type === "path" ? <Diamond size={14} /> : <Square size={14} />}
-                      <span>{item.groupId ? "▧ " : ""}{item.name}</span>
+                      {item.type === "text" ? <Type size={14} /> : item.type === "ellipse" ? <Circle size={14} /> : item.type === "path" ? <Diamond size={14} /> : item.type === "image" ? <ImageIcon size={14} /> : <Square size={14} />}
+                      <span>{item.groupPath?.length ? "▧ " : item.groupId ? "▧ " : ""}{item.name}</span>
                     </button>
                     <button className="layer-mini-action" title={item.visible === false ? "Show layer" : "Hide layer"} onClick={() => toggleVisibility(item.id)}>
                       {item.visible === false ? <EyeOff size={12} /> : <Eye size={12} />}
@@ -1391,7 +1524,7 @@ function App() {
                   <div className="empty-layers">No matching layers</div>
                 )}
               </div>
-            </div>
+            </div>}
 
             <div className="left-bottom">
               <button><Box size={15} /> Assets <ChevronRight size={14} /></button>
@@ -1475,25 +1608,37 @@ function App() {
               <svg
                 ref={svgRef}
                 className={`vector-canvas ${showGrid ? "with-grid" : ""}`}
-                viewBox="0 0 800 480"
+                viewBox={`0 0 ${800 * responsiveFrame.width / 1440} ${480 * responsiveFrame.height / 900}`}
                 preserveAspectRatio="none"
                 onPointerDown={handleCanvasPointerDown}
                 onPointerMove={handleCanvasPointerMove}
                 onPointerUp={handleCanvasPointerUp}
                 onPointerCancel={handleCanvasPointerUp}
               >
-                {animatedObjects.filter((item) => item.visible !== false).map((item) => (
-                  <g
-                    key={item.id}
-                    transform={`translate(${item.animated.x - item.x} ${item.animated.y - item.y}) translate(${item.x + item.width / 2} ${item.y + item.height / 2}) rotate(${item.animated.rotation}) scale(${item.animated.scale}) translate(${-item.x - item.width / 2} ${-item.y - item.height / 2})`}
-                  >
+                  <defs>
+                    {objects.filter((object) => object.gradient).map((object) => (
+                      object.gradient?.type === "linear"
+                        ? <linearGradient key={object.id} id={`gradient-${object.id}`} x1={object.gradient.x1} y1={object.gradient.y1} x2={object.gradient.x2} y2={object.gradient.y2}>{object.gradient.stops.map((stop, index) => <stop key={`${object.id}-${index}`} offset={stop.offset} stopColor={stop.color} stopOpacity={stop.opacity} />)}</linearGradient>
+                        : object.gradient
+                          ? <radialGradient key={object.id} id={`gradient-${object.id}`} cx={object.gradient.cx} cy={object.gradient.cy} r={object.gradient.r} fx={object.gradient.fx} fy={object.gradient.fy}>{object.gradient.stops.map((stop, index) => <stop key={`${object.id}-${index}`} offset={stop.offset} stopColor={stop.color} stopOpacity={stop.opacity} />)}</radialGradient>
+                          : null
+                    ))}
+                  </defs>
+                  {animatedObjects.filter((item) => item.visible !== false).map((item) => (
+                    <g
+                      key={item.id}
+                      opacity={item.opacity ?? 1}
+                      transform={`translate(${item.animated.x - item.x} ${item.animated.y - item.y}) translate(${item.x + item.width / 2} ${item.y + item.height / 2}) rotate(${item.animated.rotation}) scale(${item.animated.scale}) translate(${-item.x - item.width / 2} ${-item.y - item.height / 2})`}
+                    >
                     {item.type === "path" && item.points && (
                       <path
                         d={buildVectorPath(item.points, item.x, item.y, item.closed)}
-                        fill={item.closed ? item.fill : "none"}
-                        fillOpacity={0.88}
-                        stroke={item.stroke || "#e8eee9"}
-                        strokeWidth={item.strokeWidth ?? 2}
+                        fill={item.closed ? (item.gradient ? `url(#gradient-${item.id})` : item.fill) : "none"}
+                        fillOpacity={item.fillOpacity ?? 1}
+                        fillRule={item.fillRule || "nonzero"}
+                        stroke={item.stroke || "none"}
+                        strokeOpacity={item.strokeOpacity ?? 1}
+                        strokeWidth={item.strokeWidth ?? 0}
                         strokeLinejoin={item.strokeLinejoin || "round"}
                         strokeLinecap={item.strokeLinecap || "round"}
                         strokeDasharray={item.strokeDasharray || undefined}
@@ -1512,10 +1657,14 @@ function App() {
                         width={item.width}
                         height={item.height}
                         rx={item.cornerRadius ?? 5}
-                        fill={item.fill}
-                        fillOpacity={0.88}
-                        stroke={selected === item.id ? "#ffffff" : "transparent"}
-                        strokeWidth={selected === item.id ? 1.5 : 0}
+                        fill={item.gradient ? `url(#gradient-${item.id})` : item.fill}
+                        fillOpacity={item.fillOpacity ?? 1}
+                        stroke={item.stroke || "none"}
+                        strokeOpacity={item.strokeOpacity ?? 1}
+                        strokeWidth={item.strokeWidth ?? 0}
+                        strokeDasharray={item.strokeDasharray || undefined}
+                        strokeLinecap={item.strokeLinecap || "round"}
+                        strokeLinejoin={item.strokeLinejoin || "round"}
                         onPointerDown={(event) => handleObjectPointerDown(event, item)}
                         style={{ cursor: item.locked ? "not-allowed" : tool === "select" ? "move" : "crosshair" }}
                       />
@@ -1527,9 +1676,14 @@ function App() {
                         cy={item.y + item.height / 2}
                         rx={item.width / 2}
                         ry={item.height / 2}
-                        fill={item.fill}
-                        stroke={selected === item.id ? "#ffffff" : "transparent"}
-                        strokeWidth={selected === item.id ? 1.5 : 0}
+                        fill={item.gradient ? `url(#gradient-${item.id})` : item.fill}
+                        fillOpacity={item.fillOpacity ?? 1}
+                        stroke={item.stroke || "none"}
+                        strokeOpacity={item.strokeOpacity ?? 1}
+                        strokeWidth={item.strokeWidth ?? 0}
+                        strokeDasharray={item.strokeDasharray || undefined}
+                        strokeLinecap={item.strokeLinecap || "round"}
+                        strokeLinejoin={item.strokeLinejoin || "round"}
                         onPointerDown={(event) => handleObjectPointerDown(event, item)}
                         style={{ cursor: item.locked ? "not-allowed" : tool === "select" ? "move" : "crosshair" }}
                       />
@@ -1540,12 +1694,34 @@ function App() {
                         x={item.x}
                         y={item.y + (item.fontSize || 28)}
                         fontSize={item.fontSize || 28}
-                        fill={item.fill}
+                        fontFamily={item.fontFamily || "sans-serif"}
+                        fontWeight={item.fontWeight || "normal"}
+                        fontStyle={item.fontStyle || "normal"}
+                        textAnchor={item.textAnchor || "start"}
+                        letterSpacing={item.letterSpacing}
+                        textDecoration={item.textDecoration}
+                        fill={item.gradient ? `url(#gradient-${item.id})` : item.fill}
+                        fillOpacity={item.fillOpacity ?? 1}
+                        stroke={item.stroke || "none"}
+                        strokeOpacity={item.strokeOpacity ?? 1}
+                        strokeWidth={item.strokeWidth ?? 0}
                         onPointerDown={(event) => handleObjectPointerDown(event, item)}
                         style={{ cursor: item.locked ? "not-allowed" : tool === "select" ? "move" : "crosshair", userSelect: "none" }}
                       >
                         {item.text || "Text"}
                       </text>
+                    )}
+                    {item.type === "image" && item.imageData && (
+                      <image
+                        x={item.x}
+                        y={item.y}
+                        width={item.width}
+                        height={item.height}
+                        href={item.imageData}
+                        preserveAspectRatio="xMidYMid meet"
+                        onPointerDown={(event) => handleObjectPointerDown(event, item)}
+                        style={{ cursor: item.locked ? "not-allowed" : tool === "select" ? "move" : "crosshair" }}
+                      />
                     )}
 
                     {selected === item.id && item.type === "path" && item.points && tool === "direct" && item.points.map((p, index) => (
@@ -1644,15 +1820,7 @@ function App() {
             </div>
           </div>
 
-          {showCode && (
-            <div className="code-drawer">
-              <div className="code-header">
-                <span><Code2 size={14} /> VECTOR OBJECT DATA</span>
-                <button onClick={() => setShowCode(false)}><X size={15} /></button>
-              </div>
-              <pre><code>{JSON.stringify(objects, null, 2)}</code></pre>
-            </div>
-          )}
+          {showCode && <CodeModePanel website={generatedWebsite} projectName={projectName} />}
 
           <div className={`timeline-panel ${expanded ? "expanded" : ""}`}>
             <div className="timeline-header">
@@ -1779,6 +1947,20 @@ function App() {
                             onChange={(event) => updateObject(selectedObject.id, { text: event.target.value })}
                           />
                         </label>
+                      )}
+                      {selectedObject.type === "image" && (
+                        <>
+                          <input
+                            ref={imageInputRef}
+                            type="file"
+                            accept=".png,.jpg,.jpeg,.gif,.webp,image/png,image/jpeg,image/gif,image/webp"
+                            hidden
+                            onChange={replaceSelectedImage}
+                          />
+                          <button className="image-replace-button" onClick={() => imageInputRef.current?.click()}>
+                            Replace image
+                          </button>
+                        </>
                       )}
                     </div>
                   </div>
@@ -1976,13 +2158,13 @@ function App() {
               <div className="property-section">
                 <div className="property-title">RESPONSIVE PREVIEW <ChevronDown size={13} /></div>
                 <div className="device-selector">
-                  <button className={device === "desktop" ? "active" : ""} onClick={() => setDevice("desktop")}>
+                  <button className={device === "desktop" ? "active" : ""} onClick={() => { setDevice("desktop"); setDesignToolsTab("responsive"); }}>
                     <Monitor size={16} />
                   </button>
-                  <button className={device === "tablet" ? "active" : ""} onClick={() => setDevice("tablet")}>
+                  <button className={device === "tablet" ? "active" : ""} onClick={() => { setDevice("tablet"); setDesignToolsTab("responsive"); }}>
                     <Tablet size={16} />
                   </button>
-                  <button className={device === "mobile" ? "active" : ""} onClick={() => setDevice("mobile")}>
+                  <button className={device === "mobile" ? "active" : ""} onClick={() => { setDevice("mobile"); setDesignToolsTab("responsive"); }}>
                     <Smartphone size={16} />
                   </button>
                 </div>
@@ -2001,6 +2183,16 @@ function App() {
         <div><Sparkles size={13} /> Ctrl+Z Undo · Ctrl+S Save · H Pan · V Select</div>
       </footer>
     </main>
+    {pdfImportFile && (
+      <PdfImportDialog
+        file={pdfImportFile}
+        onImport={(result, description) => {
+          commitImportedObjects(result, description);
+          setPdfImportFile(null);
+        }}
+        onClose={() => setPdfImportFile(null)}
+      />
+    )}
     </>
   );
 }

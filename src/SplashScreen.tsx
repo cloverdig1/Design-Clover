@@ -11,6 +11,7 @@ export type RecentProject = {
     objects: unknown[];
     keyframes: Record<string, unknown[]>;
     device: string;
+    designSettings?: unknown;
   };
 };
 

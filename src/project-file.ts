@@ -5,6 +5,7 @@ type ProjectData = {
   objects: unknown[];
   keyframes: Record<string, unknown[]>;
   device: string;
+  designSettings?: unknown;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
